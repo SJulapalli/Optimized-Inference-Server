@@ -1,0 +1,1 @@
+A backend inference server designed to maximize GPU throughput via continuous batching and intelligent tiling approaches. Designed and tested on the m4 macbook pro.
