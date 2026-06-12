@@ -138,6 +138,12 @@ Rules (applied in order each iteration):
 
 In v1, process the entire prompt in one step (no chunking). If a prompt is too long to fit available KV blocks, the sequence stays WAITING.
 
+#### Admission Block Allocation (v1)
+
+At admission a sequence is allocated `ceil((prompt_len + 1) / block_size)` blocks — one extra slot beyond what the prompt needs. This guarantees the first decode token always has space without requiring an additional allocation at the start of the first decode step, keeping the boundary-check logic in `step()` uniform across all decode iterations.
+
+**Trade-off**: If the sequence ends immediately after prefill (EOS on the first generated token), the last block may be only partially used. The wasted capacity is at most `block_size - 1` token slots per sequence. This is acceptable in v1 for simpler logic.
+
 ---
 
 ### 3. Model Runner
@@ -346,3 +352,69 @@ safetensors       # weight loading
 2. **Preemption strategy**: v1 uses recompute — on preemption, KV blocks are freed and the sequence is re-queued; it re-runs prefill when rescheduled. Future work: swap-to-CPU, saving KV blocks to system RAM and restoring them on reschedule. This avoids redundant prefill compute for long sequences and is the preferred long-term approach given Apple Silicon's unified memory (CPU↔GPU copies are cheap).
 
 3. **Tokenizer process**: Tokenization runs in the request handler (FastAPI), not in the engine loop, so it does not block generation steps.
+
+4. **Admission pre-allocation (+1 block)**: v1 allocates one block beyond prompt capacity at admission (see Scheduler section). A future optimization is to admit with exactly `ceil(prompt_len / block_size)` blocks and change the `step()` boundary check from `==` to `>=` capacity. This eliminates the wasted slot when EOS fires immediately, at the cost of an extra allocation branch in the scheduler. Worth revisiting once the full pipeline is profiled under real load.
+
+---
+
+## v2: Chunked Prefill
+
+### Motivation
+
+In v1, a long prompt monopolizes the forward pass for its entire prefill — no decode sequences run during that time. This causes head-of-line blocking: a 4096-token prefill can stall all decoding sequences for many milliseconds. Chunked prefill fixes this by breaking the prompt into fixed-size chunks and interleaving prefill chunks with decode steps.
+
+### Sequence State Changes
+
+`Sequence` gains one field:
+
+```python
+num_computed_tokens: int = 0  # how many prompt tokens have been KV-computed so far
+```
+
+A sequence stays in `PREFILL` until `num_computed_tokens == num_prompt_tokens`. Each step only processes `min(chunk_size, num_prompt_tokens - num_computed_tokens)` tokens.
+
+### Configuration
+
+```python
+@dataclass
+class ServerConfig:
+    ...
+    prefill_chunk_size: int = 512  # max prompt tokens to process per step per sequence
+```
+
+### Scheduler Changes
+
+**Admission**: Allocate blocks only for the first chunk (not the full prompt):
+
+```python
+first_chunk = min(prefill_chunk_size, prompt_len)
+required_blocks = ceil((first_chunk + 1) / block_size)
+```
+
+Remaining blocks are allocated incrementally as prefill progresses, one chunk at a time.
+
+**`step()` — prefill sequences**: For each PREFILL sequence in the active list, compute the next chunk range `[num_computed_tokens, num_computed_tokens + chunk_size)`. Check if the blocks needed for this chunk are available; allocate them or preempt. Pass the chunk slice (not the full prompt) to the model runner.
+
+**`step()` — decode sequences**: Unchanged. Decode sequences always run alongside partial-prefill sequences in the same forward pass.
+
+**`update()` — prefill progress**: After the forward pass, increment `num_computed_tokens` by the chunk size. If `num_computed_tokens == num_prompt_tokens`, transition to `DECODE`. Otherwise remain `PREFILL` and stay in `active_sequences`.
+
+### Batch Representation Changes
+
+`Batch.prefill_token_ids` becomes a list of per-sequence chunk slices rather than full prompts:
+
+```python
+prefill_token_ids: list[list[int]]   # [num_prefill_seqs, chunk_len_i]  — variable length
+prefill_positions: list[list[int]]   # absolute positions for this chunk (for RoPE)
+prefill_block_tables: list[list[int]]
+```
+
+The model runner must handle variable-length prefill inputs across sequences in the same batch.
+
+### Paged Attention Impact
+
+During a chunked prefill step, only the KV entries for the current chunk are written into the block pool. On subsequent chunks, the attention for the new chunk tokens attends over all previously written KV entries (earlier chunks) plus the current chunk (causal mask). This is the same gather logic as decode — the page table already handles non-contiguous KV.
+
+### Admission Block Pre-allocation
+
+In v2 the +1 pre-allocation at admission (see Decisions §4) is no longer meaningful — blocks are allocated per-chunk. The extra slot is dropped: admit with `ceil(first_chunk_len / block_size)` blocks exactly, and rely on the per-chunk allocation logic in `step()` to grow the block table as the prefill progresses.

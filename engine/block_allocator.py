@@ -21,6 +21,7 @@ class BlockAllocator:
     
     def free(self, block_ids: list[int]) -> None:
         self.free_blocks.extend(block_ids)
-        
+    
+    @property
     def num_free_blocks(self) -> int:
         return len(self.free_blocks)

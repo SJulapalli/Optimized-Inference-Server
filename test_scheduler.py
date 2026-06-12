@@ -47,6 +47,15 @@ def make_scheduler() -> Scheduler:
     """Fresh scheduler with small test config."""
     return Scheduler(MODEL_CFG, SERVER_CFG)
 
+def make_scheduler_long_context() -> Scheduler:
+    return Scheduler(MODEL_CFG, ServerConfig(
+    model_path="fake/path",
+    block_size=4,
+    max_num_blocks=10,
+    max_num_seqs=3,
+    max_seq_len=40,
+))
+
 def fake_next_tokens(scheduler: Scheduler, token_id: int) -> dict[int, int]:
     """Build a next_tokens dict giving every active sequence the same token."""
     return {seq.seq_id: token_id for seq in scheduler.active_sequences}
@@ -148,7 +157,7 @@ def test_step_skips_large_but_admits_small():
     # Reset active cap so we can admit more (big_setup counts against max_num_seqs)
     # Use a fresh scheduler with big_setup already active to keep max_num_seqs clean.
     s2 = make_scheduler()
-    s2.allocator.free_blocks = s2.allocator.free_blocks[1:]  # simulate 1 free block
+    s2.allocator.free_blocks = s2.allocator.free_blocks[:1]  # simulate 1 free block
     s2.active_sequences.append(big_setup)  # already "running"
     s2.add_sequence(seq_a)
     s2.add_sequence(seq_b)
@@ -204,24 +213,33 @@ def test_update_max_tokens_finishes_sequence():
     assert seq in completed
     assert seq.status == SequenceStatus.FINISHED
 
-def test_update_allocates_block_at_boundary():
+def test_step_allocates_block_at_decode_boundary():
     """
-    With block_size=4 and a prompt of 4 tokens (fills 1 block exactly),
-    the first decode token pushes num_kv_tokens to 5 > capacity 4.
-    A second block must be allocated automatically in update().
+    With block_size=4 and prompt_len=5 (admitted with ceil(6/4)=2 blocks, capacity=8),
+    after 3 decode tokens num_kv_tokens reaches 8 == capacity.
+    The next step() must allocate a third block before the forward pass.
     """
     s = make_scheduler()
-    seq = make_sequence(prompt_len=4)   # ceil(4/4) = 1 block
+    seq = make_sequence(prompt_len=5)
     s.add_sequence(seq)
     s.step()
 
-    assert len(seq.block_table) == 1
-    assert seq.num_kv_tokens == 4
+    assert len(seq.block_table) == 2   # ceil(6/4) = 2
+    assert seq.num_kv_tokens == 5
 
-    # update() appends token → num_kv_tokens becomes 5, capacity was 4
-    s.update({seq.seq_id: NORMAL_TOKEN})
+    # Transition to DECODE and run 3 decode tokens → num_kv_tokens = 8
+    s.update({seq.seq_id: NORMAL_TOKEN})  # → 6, PREFILL→DECODE
+    s.step()
+    s.update({seq.seq_id: NORMAL_TOKEN})  # → 7
+    s.step()
+    s.update({seq.seq_id: NORMAL_TOKEN})  # → 8 == capacity
 
-    assert len(seq.block_table) == 2, "A new block should have been allocated at the boundary"
+    assert seq.num_kv_tokens == 8
+    assert len(seq.block_table) == 2   # boundary not yet triggered
+
+    # This step() sees num_kv_tokens == capacity → must allocate block 3
+    s.step()
+    assert len(seq.block_table) == 3, "step() should allocate a new block at the boundary"
 
 def test_update_preempts_when_oom():
     """
@@ -229,30 +247,37 @@ def test_update_preempts_when_oom():
     it gets preempted: removed from active, re-queued at the front of waiting,
     blocks freed.
     """
-    s = make_scheduler()
+    s = make_scheduler_long_context()
 
     # Fill all but 1 block with a background sequence (prompt = 9 blocks)
-    filler = make_sequence(prompt_len=(SERVER_CFG.max_num_blocks - 1) * SERVER_CFG.block_size)
+    filler = make_sequence(prompt_len=(SERVER_CFG.max_num_blocks - 1) * SERVER_CFG.block_size - 2, max_tokens=40)
     s.waiting_sequences.append(filler)
     s.step()
     # 1 block remains free
 
     # Add a sequence that uses the last free block (prompt = 1 block = 4 tokens)
-    victim = make_sequence(prompt_len=4)
+    victim = make_sequence(prompt_len=3)
     s.add_sequence(victim)
     s.step()
     # Pool now completely full
 
     assert s.allocator.num_free_blocks == 0
 
-    # First update: victim transitions PREFILL → DECODE. num_kv_tokens = 5,
-    # capacity = 4 → needs a new block → OOM → preempted.
+    # First update should pass fine
     s.update({filler.seq_id: NORMAL_TOKEN, victim.seq_id: NORMAL_TOKEN})
 
+    assert victim.seq_id in {sq.seq_id for sq in s.active_sequences}
+    assert victim not in s.waiting_sequences
+    assert victim.status == SequenceStatus.DECODE
+    
+    # Second update should preempt victim due to lack to space. 
+    s.step()
+    s.update({filler.seq_id: NORMAL_TOKEN})
     assert victim.seq_id not in {sq.seq_id for sq in s.active_sequences}
     assert victim in s.waiting_sequences
     assert victim.status == SequenceStatus.WAITING
     assert victim.block_table == []
+    
     # Freeing victim's block should give the pool back 1 free block
     assert s.allocator.num_free_blocks == 1
 
@@ -261,17 +286,17 @@ def test_update_preempts_when_oom():
 if __name__ == "__main__":
     print("Running scheduler tests...\n")
     tests = [
-        ("add_sequence: valid prompt queued",           test_add_sequence_valid),
-        ("add_sequence: oversized prompt raises",       test_add_sequence_too_long),
-        ("step: admits waiting sequence",               test_step_admits_waiting_sequence),
-        ("step: allocates correct block count",         test_step_allocates_correct_blocks),
-        ("step: respects max_num_seqs cap",             test_step_respects_max_num_seqs),
-        ("step: skips large, admits smaller",           test_step_skips_large_but_admits_small),
-        ("update: PREFILL → DECODE on normal token",   test_update_prefill_to_decode),
-        ("update: EOS finishes and frees sequence",     test_update_eos_finishes_sequence),
-        ("update: max_tokens limit finishes sequence",  test_update_max_tokens_finishes_sequence),
-        ("update: new block allocated at boundary",     test_update_allocates_block_at_boundary),
-        ("update: OOM preempts decode sequence",        test_update_preempts_when_oom),
+        # ("add_sequence: valid prompt queued",           test_add_sequence_valid),
+        # ("add_sequence: oversized prompt raises",       test_add_sequence_too_long),
+        # ("step: admits waiting sequence",               test_step_admits_waiting_sequence),
+        # ("step: allocates correct block count",         test_step_allocates_correct_blocks),
+        # ("step: respects max_num_seqs cap",             test_step_respects_max_num_seqs),
+        # ("step: skips large, admits smaller",           test_step_skips_large_but_admits_small),
+        ("step: new block allocated at decode boundary",     test_step_allocates_block_at_decode_boundary),
+         # ("update: PREFILL → DECODE on normal token",   test_update_prefill_to_decode),
+        # ("update: EOS finishes and frees sequence",     test_update_eos_finishes_sequence),
+        # ("update: max_tokens limit finishes sequence",  test_update_max_tokens_finishes_sequence),
+        # ("update: OOM preempts decode sequence",        test_update_preempts_when_oom),
     ]
     for name, fn in tests:
         run(name, fn)

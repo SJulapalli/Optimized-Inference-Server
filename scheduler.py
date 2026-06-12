@@ -26,15 +26,30 @@ class Scheduler:
     
     def step(self):
         i = 0 
+        k = 0
         prefill_sequences = []
         decode_sequences = []
         blocks_to_free = []
         
-        for sequence in self.active_sequences:
+        while k < len(self.active_sequences):
+            sequence = self.active_sequences[k]
+            if sequence.num_kv_tokens - len(sequence.block_table) * self.server_config.block_size >= 0:
+                try:
+                    sequence.block_table.extend(self.allocator.allocate(1))
+                except MemoryError:
+                    self.active_sequences.pop(k)
+                    sequence.status = SequenceStatus.WAITING
+                    self.allocator.free(sequence.block_table)
+                    sequence.block_table = []
+                    self.waiting_sequences.insert(0, sequence)
+                    continue
+            
             if sequence.status == SequenceStatus.PREFILL:
                 prefill_sequences.append(sequence)
             elif sequence.status == SequenceStatus.DECODE:
                 decode_sequences.append(sequence)
+                
+            k += 1
 
         # Loop over waiting sequences
         while i < len(self.waiting_sequences):
@@ -43,7 +58,7 @@ class Scheduler:
                 break
             
             sequence = self.waiting_sequences[i]
-            required_blocks = ceil(len(sequence.prompt_token_ids) / self.server_config.block_size)
+            required_blocks = ceil((sequence.num_kv_tokens + 1) / self.server_config.block_size)
             
             # Check if sufficient KV cache blocks are available
             if self.allocator.num_free_blocks >= required_blocks:
@@ -88,17 +103,18 @@ class Scheduler:
                 completed_sequences.append(sequence)
                 continue
             
+            # Should no longer be necessary.
             # Check if the sequence needs more space to continue, if it does and we can't provide it then we preempt.
-            if sequence.num_kv_tokens - len(sequence.block_table) * self.server_config.block_size > 0:
-                try:
-                    sequence.block_table.extend(self.allocator.allocate(1))
-                except MemoryError:
-                    self.active_sequences.pop(i)
-                    sequence.status = SequenceStatus.WAITING
-                    self.allocator.free(sequence.block_table)
-                    sequence.block_table = []
-                    self.waiting_sequences.insert(0, sequence)
-                    continue
+            # if sequence.num_kv_tokens - len(sequence.block_table) * self.server_config.block_size > 0:
+            #     try:
+            #         sequence.block_table.extend(self.allocator.allocate(1))
+            #     except MemoryError:
+            #         self.active_sequences.pop(i)
+            #         sequence.status = SequenceStatus.WAITING
+            #         self.allocator.free(sequence.block_table)
+            #         sequence.block_table = []
+            #         self.waiting_sequences.insert(0, sequence)
+            #         continue
             
             if sequence.status == SequenceStatus.PREFILL:
                 sequence.status = SequenceStatus.DECODE
