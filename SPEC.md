@@ -210,11 +210,13 @@ Weights loaded from HuggingFace safetensors format, converted to MLX float16.
 **Responsibility**: Convert logits to next tokens.
 
 Supported strategies (selected per-request):
-- **Greedy**: `argmax(logits)`
+- **Greedy**: `argmax(logits)` — used when neither top-k nor top-p is set
 - **Temperature + top-p**: scale logits by `1/T`, softmax, sample from nucleus
 - **Temperature + top-k**: scale logits by `1/T`, restrict to top-k, sample
 
-Output: `list[int]` of sampled token ids, one per sequence in the decode batch.
+`SamplingParams` sentinel values: `top_k = -1` means top-k disabled; `top_p = -1.0` means top-p disabled. When both are disabled, greedy is used.
+
+Output: `dict[int, int]` mapping seq_id → sampled token id, one entry per sequence in the batch.
 
 ---
 
