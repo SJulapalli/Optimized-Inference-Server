@@ -152,39 +152,57 @@ At admission a sequence is allocated `ceil((prompt_len + 1) / block_size)` block
 
 #### Batch Representation
 
+All tokens from all sequences — both prefill and decode — are packed into a single flat input for one forward pass.
+
 ```python
 @dataclass
 class Batch:
-    # Prefill sequences: process full prompt in parallel
-    prefill_token_ids: list[list[int]]     # [num_prefill_seqs, prompt_len]
-    prefill_positions: list[list[int]]     # absolute token positions for RoPE
-    prefill_block_tables: list[list[int]]  # block_table per prefill seq
-
-    # Decode sequences: one new token each
-    decode_token_ids: list[int]            # [num_decode_seqs], the last generated token
-    decode_positions: list[int]            # current position in each decode seq
-    decode_block_tables: list[list[int]]   # block_table per decode seq
+    token_ids: list[int]          # all tokens packed: [*prefill_0_tokens, ..., *prefill_N_tokens, decode_0_token, ...]
+    positions: list[int]          # absolute position of each token in its own sequence (for RoPE)
+    block_tables: list[list[int]] # one block_table per sequence, in the same order as sequences appear in token_ids
+    seq_lens: list[int]           # number of tokens contributed by each sequence (prompt_len for prefill, 1 for decode)
+    num_prefill_seqs: int         # how many sequences at the front are prefill; the rest are decode
 ```
 
-Prefill and decode sequences can be batched together in a single forward pass (they differ only in how Q is shaped and how attention masking works).
+`seq_lens` and `num_prefill_seqs` let the runner reconstruct per-sequence token ranges for masking and output extraction.
+
+#### Token Packing and Attention Mask
+
+The packed `token_ids` are embedded and passed through the model as a single `[1, total_tokens]` input. Attention uses a **block-diagonal mask**: each token attends only to tokens within its own sequence's KV history and its own causal context — never to tokens from other sequences.
+
+For a step with prefill sequences of lengths `[3, 5]` and 2 decode sequences, `total_tokens = 11`. The attention mask shape is `[1, 1, total_tokens, total_kv_tokens]` where `total_kv_tokens = sum of all sequences' num_kv_tokens after writing the current step`. Each row is non-zero only for the KV range belonging to that token's sequence.
 
 #### Paged Attention
 
-The model uses `mlx.core.fast.scaled_dot_product_attention` as the attention primitive. Before calling it, the runner gathers K and V tensors from the block pool using each sequence's page table:
+The model uses `mlx.core.fast.scaled_dot_product_attention` as the attention primitive. At each layer, the runner:
+
+1. **Writes** the new K/V projections for the current tokens into the block pool at the correct block and slot for each sequence.
+2. **Gathers** the full KV history for every sequence from the block pool using its block table, then concatenates into `[1, n_kv_heads, total_kv_tokens, head_dim]`.
 
 ```
-For each sequence:
-  gathered_K = block_pool[block_table, 0, :, :num_valid_tokens, :]  # gather + reshape
-  gathered_V = block_pool[block_table, 1, :, :num_valid_tokens, :]
+For each sequence i:
+  gathered_K_i = block_pool[block_table_i, 0, :, :, :]  # reshape to [n_kv_heads, kv_len_i, head_dim]
+  gathered_V_i = block_pool[block_table_i, 1, :, :, :]
+
+K = concat([gathered_K_0, ..., gathered_K_N], axis=1)   # [1, n_kv_heads, total_kv_tokens, head_dim]
+V = concat([gathered_V_0, ..., gathered_V_N], axis=1)
 ```
 
-After the attention projection, new K and V slices are written back into the current block at the correct offset.
+The block-diagonal attention mask enforces that query tokens from sequence `i` only attend to KV positions in the range `[kv_start_i, kv_end_i)`.
 
 The gather/scatter ops are the primary cost of paging vs. contiguous KV — this is acceptable because the memory flexibility it provides is worth it.
 
 #### RoPE
 
-Applied to Q and K after projection, before attention. Uses absolute positions from `prefill_positions` / `decode_positions`. Pre-compute the cos/sin tables up to max_seq_len at model load time.
+Applied to Q and K after projection, before attention. Each token requires its **absolute position** within its own sequence — not a shared offset — so the `positions` array from the `Batch` is passed directly. Pre-compute the cos/sin tables up to `max_seq_len` at model load time.
+
+#### Output Extraction
+
+The model returns `[1, total_tokens, vocab_size]`. The runner extracts one logit vector per sequence:
+- **Prefill sequences**: the logit at the last token of each prefill sequence's range.
+- **Decode sequences**: the single logit for each decode token.
+
+The result is `[num_sequences, vocab_size]`, passed to the sampler.
 
 #### Model Architecture (Llama 3.1 8B)
 
@@ -257,20 +275,22 @@ Server-Sent Events (SSE) for streaming. Non-streaming requests buffer all tokens
 2. model_runner.build_batch(scheduler_output) → Batch
 
 3. model_runner.forward(batch)
-   ├── embed tokens
+   ├── embed packed token_ids → [1, total_tokens, d_model]
+   ├── build block-diagonal attention mask [1, 1, total_tokens, total_kv_tokens]
    ├── for each layer:
    │   ├── RMSNorm
    │   ├── QKV projection
-   │   ├── apply RoPE to Q, K
-   │   ├── gather K, V from block pool via page tables
-   │   ├── write new K, V into current block slot
-   │   ├── scaled_dot_product_attention(Q, gathered_K, gathered_V)
+   │   ├── apply RoPE to Q, K using per-token positions array
+   │   ├── write new K, V into block pool at correct block/slot per sequence
+   │   ├── gather full KV history per sequence, concatenate → [1, n_kv_heads, total_kv_tokens, head_dim]
+   │   ├── scaled_dot_product_attention(Q, gathered_K, gathered_V, mask=block_diagonal_mask)
    │   ├── output projection
    │   ├── RMSNorm
    │   └── SwiGLU FFN
-   └── LM head → logits [num_decode_seqs, vocab_size]
+   ├── LM head → [1, total_tokens, vocab_size]
+   └── extract one logit vector per sequence → [num_sequences, vocab_size]
 
-4. sampler.sample(logits, sampling_params) → next_token_ids
+4. sampler.sample(logits, sequences) → next_token_ids  # dict[int, int]
 
 5. scheduler.update(next_token_ids)
    ├── append tokens to sequence outputs
