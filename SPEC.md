@@ -58,23 +58,24 @@ HTTP Client
 
 #### Block
 
-The atomic unit of KV storage.
+The atomic unit of KV storage. Each block covers `block_size` token positions **across all transformer layers simultaneously** — one physical block ID indexes into every layer's KV storage.
 
 ```
-shape: [2, num_kv_heads, block_size, head_dim]
-  - dim 0: key vs value
+pool shape: [num_blocks, num_layers, 2, num_kv_heads, block_size, head_dim]
+  - num_blocks:   total physical blocks in the pool
+  - num_layers:   32 (all transformer layers share the same block indices)
+  - dim 2:        0 = key, 1 = value
   - num_kv_heads: 8 (Llama 3.1 8B/70B)
-  - block_size: 16 tokens (configurable, power of 2)
-  - head_dim: 128
+  - block_size:   16 tokens (configurable, power of 2)
+  - head_dim:     128
 
 dtype: float16
 ```
 
-For the 8B model at block_size=16:
-`2 × 8 × 16 × 128 × 2 bytes = 65,536 bytes (~64KB) per block`
+For the 8B model at block_size=16, per block:
+`32 × 2 × 8 × 16 × 128 × 2 bytes = 2,097,152 bytes (~2MB) per block`
 
-The full block pool is pre-allocated as a single MLX array:
-`[num_blocks, 2, num_kv_heads, block_size, head_dim]`
+The full block pool is pre-allocated as a single MLX array owned by `BlockAllocator`.
 
 #### BlockAllocator
 
@@ -191,6 +192,21 @@ V = concat([gathered_V_0, ..., gathered_V_N], axis=1)
 The block-diagonal attention mask enforces that query tokens from sequence `i` only attend to KV positions in the range `[kv_start_i, kv_end_i)`.
 
 The gather/scatter ops are the primary cost of paging vs. contiguous KV — this is acceptable because the memory flexibility it provides is worth it.
+
+#### BatchPagedKVCache
+
+`BatchPagedKVCache` is the per-step coordinator for paged attention. It is created fresh each forward pass from the current batch's sequence state and handles write (scatter) and gather for all sequences in one step.
+
+**Persistent state** lives in two places — not in the cache object itself:
+- `BlockAllocator.pool` — the actual KV tensor storage, alive for the server's lifetime
+- `Sequence.block_table` — the per-sequence mapping from logical block index to physical block ID, lives on the sequence object
+
+**Ephemeral state** (lives only for one forward pass):
+- `BatchPagedKVCache` — constructed from the current batch's block tables, kv offsets, and seq lens; discarded after the step
+
+This means preemption requires no cache-level cleanup: the scheduler frees the sequence's block IDs back to the allocator, and the preempted sequence simply does not appear in the next batch. KV data at those blocks becomes unreachable (no active block table points to it) and will be overwritten when those blocks are reallocated.
+
+The block pool shape is `[num_blocks, num_layers, 2, num_kv_heads, block_size, head_dim]`. The `num_layers` dimension means one physical block covers KV storage for all transformer layers at the token positions it holds. A single `block_table` on each sequence indexes into all layers — `BatchPagedKVCache` is instantiated once per layer and slices `pool[:, layer_idx, ...]`.
 
 #### RoPE
 

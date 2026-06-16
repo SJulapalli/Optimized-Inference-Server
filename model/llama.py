@@ -92,6 +92,7 @@ class Attention(nn.Module):
         keys = self.rope(keys, offset=positions)
 
         # Prepare the queries, keys and values for the attention computation
+        # (B, L, num_heads, head_dim)
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
