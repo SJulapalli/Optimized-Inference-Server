@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Inference Server</title>
+  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.development.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.development.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #f9f9f9; }
+    h1 { font-size: 1.3rem; margin-bottom: 1.5rem; }
+    textarea { width: 100%; box-sizing: border-box; padding: 10px; font-size: 0.95rem; border: 1px solid #ccc; border-radius: 6px; resize: vertical; }
+    .controls { display: flex; gap: 16px; align-items: center; margin: 10px 0; flex-wrap: wrap; }
+    label { font-size: 0.85rem; color: #555; }
+    input[type=number] { width: 70px; padding: 4px 6px; border: 1px solid #ccc; border-radius: 4px; }
+    input[type=range] { width: 120px; }
+    button { padding: 8px 20px; background: #2563eb; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 0.95rem; }
+    button:disabled { background: #93c5fd; cursor: not-allowed; }
+    .output { margin-top: 16px; background: white; border: 1px solid #ddd; border-radius: 6px; padding: 14px; min-height: 80px; font-size: 0.95rem; white-space: pre-wrap; line-height: 1.6; }
+    .error { color: #dc2626; font-size: 0.85rem; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+    const { useState, createElement: h } = React;
+    const API = "http://localhost:8000";
+
+    function App() {
+      const [prompt, setPrompt] = useState("");
+      const [output, setOutput] = useState("");
+      const [loading, setLoading] = useState(false);
+      const [error, setError] = useState("");
+      const [temperature, setTemperature] = useState(0.8);
+      const [maxTokens, setMaxTokens] = useState(256);
+      const [mode, setMode] = useState("completions");
+      const [repPenalty, setRepPenalty] = React.useState(1.2);
+      const [topP, setTopP] = React.useState(-1.0);
+      const [topK, setTopK] = React.useState(-1);
+
+      async function handleSubmit(e) {
+        e.preventDefault();
+        if (!prompt.trim()) return;
+        setOutput(""); setError(""); setLoading(true);
+
+        const body = mode === "chat"
+          ? { model: "llama", messages: [{ role: "user", content: prompt }], top_p: topP, top_k: topK,  repetition_penalty: repPenalty, temperature, max_tokens: maxTokens, stream: true }
+          : { model: "llama", prompt, top_p: topP, top_k: topK, repetition_penalty: repPenalty, temperature, max_tokens: maxTokens, stream: true };
+
+        try {
+          const res = await fetch(`${API}/v1/${mode === "chat" ? "chat/completions" : "completions"}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let buf = "";
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            const lines = buf.split("\n");
+            buf = lines.pop();
+            for (const line of lines) {
+              if (!line.startsWith("data: ")) continue;
+              const payload = line.slice(6).trim();
+              if (payload === "[DONE]") { setLoading(false); return; }
+              try {
+                const event = JSON.parse(payload);
+                const text = mode === "chat"
+                  ? event.choices?.[0]?.delta?.content ?? ""
+                  : event.choices?.[0]?.text ?? "";
+                setOutput(prev => prev + text);
+              } catch {}
+            }
+          }
+        } catch (err) {
+          setError(err.message);
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      return h("div", null,
+        h("h1", null, "Inference Server"),
+        h("form", { onSubmit: handleSubmit },
+          h("textarea", { rows: 4, placeholder: "Enter your prompt...", value: prompt, onChange: e => setPrompt(e.target.value) }),
+          h("div", { className: "controls" },
+            h("label", null, "Mode:\u00a0",
+              h("select", { value: mode, onChange: e => setMode(e.target.value) },
+                h("option", { value: "completions" }, "Completions"),
+                h("option", { value: "chat" }, "Chat")
+              )
+            ),
+            h("label", null, `Temp: ${temperature}\u00a0`,
+              h("input", { type: "range", min: "0", max: "2", step: "0.05", value: temperature, onChange: e => setTemperature(parseFloat(e.target.value)) })
+            ),
+            h("label", null, `Rep penalty: ${repPenalty}\u00a0`,
+              h("input", { type: "range", min: "1.0", max: "1.5", step: "0.05",
+                value: repPenalty, onChange: e => setRepPenalty(parseFloat(e.target.value)) })
+            ),
+            h("label", null, `Top-p: ${topP < 0 ? "off" : topP}\u00a0`,
+              h("input", { type: "range", min: "-1", max: "1", step: "0.05",
+                value: topP, onChange: e => setTopP(parseFloat(e.target.value)) })
+            ),
+            h("label", null, "Top-k:\u00a0",
+              h("input", { type: "number", min: "-1", max: "200",
+                value: topK, onChange: e => setTopK(parseInt(e.target.value)) })
+            ),
+            h("label", null, "Max tokens:\u00a0",
+              h("input", { type: "number", min: "1", max: "2048", value: maxTokens, onChange: e => setMaxTokens(parseInt(e.target.value)) })
+            ),
+            h("button", { type: "submit", disabled: loading }, loading ? "Generating\u2026" : "Generate")
+          )
+        ),
+        error ? h("div", { className: "error" }, error) : null,
+        (output || loading) ? h("div", { className: "output" }, output, loading ? "\u258c" : null) : null
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(h(App, null));
+  </script>
+</body>
+</html>

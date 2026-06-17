@@ -1,12 +1,23 @@
 import mlx.core as mx
 from engine.sequence import SamplingParams, Sequence
 
+def _apply_repetition_penalty(logits: mx.array, token_ids: list[int], penalty: float) -> mx.array:
+    if not token_ids:
+        return logits
+    unique_ids = mx.array(list(set(token_ids)))
+    penalty_arr = mx.ones(logits.shape)
+    penalty_arr = penalty_arr.at[unique_ids].set(penalty)
+    return mx.where(logits > 0, logits / penalty_arr, logits * penalty_arr)
 
 def sample(logits_arrays: mx.array, sequences: list[Sequence]) -> dict[int, int]:
     sampled_tokens = {}
     
     for logits, sequence in zip(logits_arrays, sequences):
         sample_params = sequence.sampling_params
+        if sample_params.repetition_penalty != 1.0:
+            seen = sequence.prompt_token_ids + sequence.output_token_ids
+            logits = _apply_repetition_penalty(logits, seen, sample_params.repetition_penalty)
+            
         if sample_params.top_k != -1:
             sampled_tokens[sequence.seq_id] = _top_k_sample(logits, sample_params)
         elif sample_params.top_p != -1:

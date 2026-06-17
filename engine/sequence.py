@@ -16,6 +16,8 @@ class SamplingParams:
     top_p: float = -1.0
     top_k: int = -1        # -1 means disabled
     max_tokens: int = 256
+    repetition_penalty: float = 1.0   # add this
+
 
 @dataclass
 class Sequence:
