@@ -3,6 +3,7 @@ from math import ceil
 from engine.sequence import Sequence, SequenceStatus
 from engine.block_allocator import BlockAllocator
 from config import ModelConfig, ServerConfig
+from typing import Optional
 
 @dataclass
 class SchedulerOutput:
@@ -11,12 +12,13 @@ class SchedulerOutput:
     blocks_to_free: list[int] = field(default_factory=list)
 
 class Scheduler:
-    def __init__(self, model_config: ModelConfig, server_config: ServerConfig):
+    def __init__(self, model_config: ModelConfig, server_config: ServerConfig, block_allocator: Optional[BlockAllocator] = None):
         self.waiting_sequences: list[Sequence] = []
         self.active_sequences: list[Sequence] = []
         self.model_config = model_config
         self.server_config = server_config
-        self.allocator : BlockAllocator = BlockAllocator(model_config, server_config)
+        self.allocator = block_allocator if block_allocator is not None else BlockAllocator(model_config, server_config)
+
         
     def add_sequence(self, sequence: Sequence):
         if len(sequence.prompt_token_ids) > self.server_config.max_seq_len:

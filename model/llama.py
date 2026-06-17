@@ -76,7 +76,7 @@ class Attention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-        positions: Optional[mx.array] = None,
+        positions: Optional[mx.array] = None
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -100,8 +100,9 @@ class Attention(nn.Module):
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
+        # Normally we'd pass in the cache to utilize it for flash attention, but we'll skip that for now.
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            queries, keys, values, cache=None, scale=self.scale, mask=mask
         )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
@@ -146,8 +147,9 @@ class TransformerBlock(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        positions: Optional[mx.array] = None
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        r = self.self_attn(self.input_layernorm(x), mask, cache, positions=positions)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         out = h + r
@@ -181,6 +183,8 @@ class LlamaModel(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        positions: Optional[mx.array] = None,
+        block_mask=None
     ):
         if input_embeddings is not None:
             h = input_embeddings
@@ -190,15 +194,18 @@ class LlamaModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        fa_mask = create_attention_mask(h, cache[self.fa_idx])
+        fa_mask = block_mask if block_mask is not None else create_attention_mask(h, cache[self.fa_idx])
         if self.swa_idx is not None:
             swa_mask = create_attention_mask(
                 h, cache[self.swa_idx], window_size=self.sliding_window
             )
+            
+            if fa_mask is not None and swa_mask is not None:
+                swa_mask = fa_mask + swa_mask
 
         for layer, cache in zip(self.layers, cache):
             mask = swa_mask if layer.use_sliding else fa_mask
-            h = layer(h, mask, cache=cache)
+            h = layer(h, mask, cache=cache, positions=positions)
 
         return self.norm(h)
 
@@ -217,8 +224,10 @@ class Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        positions: Optional[mx.array] = None,
+        block_mask=None
     ):
-        out = self.model(inputs, cache, input_embeddings)
+        out = self.model(inputs, cache, input_embeddings, positions=positions, block_mask=block_mask)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:

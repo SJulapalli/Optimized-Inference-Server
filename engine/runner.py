@@ -1,6 +1,8 @@
 from dataclasses import dataclass
-from scheduler import SchedulerOutput
-from block_allocator import BlockAllocator
+from scheduler import SchedulerOutput, Sequence, SequenceStatus
+from .block_allocator import BlockAllocator
+from model.llama import Model
+from sampling.sampler import sample
 import mlx.core as mx
 import numpy as np
 
@@ -11,6 +13,7 @@ class Batch:
     block_tables: list[list[int]] # one block_table per sequence, in the same order as sequences appear in token_ids
     seq_lens: list[int]           # number of tokens contributed by each sequence (prompt_len for prefill, 1 for decode)
     num_prefill_seqs: int         # how many sequences at the front are prefill; the rest are decode
+    kv_cache_offsets: list[int]
     
 # Positions aren't deeply managed yet, but will need to be managed once chunked inputs start being handled.
 def build_batch(schedule: SchedulerOutput):
@@ -24,7 +27,9 @@ def build_batch(schedule: SchedulerOutput):
     block_tables = [sequence.block_table for sequence in sequences]
     num_prefill_seqs = len(schedule.prefill_sequences)
     
-    return Batch(token_ids=token_ids, positions=positions, block_tables=block_tables, seq_lens=seq_lens, num_prefill_seqs=num_prefill_seqs)
+    kv_cache_offsets = [0 if seq.status == SequenceStatus.PREFILL else seq.num_kv_tokens - 1 for seq in sequences]
+    
+    return Batch(token_ids=token_ids, positions=positions, block_tables=block_tables, seq_lens=seq_lens, num_prefill_seqs=num_prefill_seqs, kv_cache_offsets=kv_cache_offsets)
 
 class BatchPagedKVCache:
     
@@ -48,7 +53,7 @@ class BatchPagedKVCache:
 
                 self.block_allocator.pool[mem_block_id, self.layer, 0, :, inner_index, :] = keys[0, :, seq_start + t, :]
                 self.block_allocator.pool[mem_block_id, self.layer, 1, :, inner_index, :] = values[0, :, seq_start + t, :]
-                
+        
         keys = []
         values = []
         
@@ -71,3 +76,57 @@ class BatchPagedKVCache:
         values = mx.concatenate(values, axis=1)
         
         return keys[None], values[None]
+    
+def compute_kv_offsets(sequences: list[Sequence]) -> list[int]:
+    return [0 if seq.status == SequenceStatus.PREFILL else seq.num_kv_tokens - 1 for seq in sequences]
+
+def build_block_diagonal_mask(seq_lens: list[int], kv_offsets: list[int], num_prefill_seqs: int) -> mx.array:
+    # Derive kv_lens, total_tokens, total_kv_tokens
+    total_tokens = np.sum(seq_lens)
+    total_kv_tokens = total_tokens + np.sum(kv_offsets)
+    # Initialize mask as all -inf, shape [total_tokens, total_kv_tokens]
+    mask = np.full((total_tokens, total_kv_tokens), -np.inf)
+
+    q_start = 0
+    kv_start = 0
+
+    for i, (seq_len, kv_offset) in enumerate(zip(seq_lens, kv_offsets)):
+        kv_len = kv_offset + seq_len
+        q_end = q_start + seq_len
+        kv_end = kv_start + kv_len
+
+        if i < num_prefill_seqs:
+            # Fill causal triangular block at mask[q_start:q_end, kv_start:kv_end]
+            # print(q_start, q_end, kv_start, kv_end, mask.shape)
+            # print(mask[q_start:q_end, kv_start:kv_end])
+            mask[q_start:q_end, kv_start:kv_end] = np.triu(mask[q_start:q_end, kv_start:kv_end], k=kv_offset + 1)
+        else:
+            # Fill full block at mask[q_start:q_end, kv_start:kv_end] with zeros
+            mask[q_start:q_end, kv_start:kv_end] = 0
+
+        q_start = q_end
+        kv_start = kv_end
+
+    return mx.array(mask[None, None].astype(np.float16))
+
+class ModelRunner:
+    def __init__(self, model:Model, block_allocator: BlockAllocator):
+        self.model = model
+        self.block_allocator = block_allocator
+        self.num_layers = model.args.num_hidden_layers
+    
+    def forward(self, batch: Batch):
+        # Build the per-layer BatchedPagedKVCache
+        kv_cache_offsets = batch.kv_cache_offsets
+        cache = [BatchPagedKVCache(batch.block_tables, kv_cache_offsets=kv_cache_offsets, layer=i, block_allocator=self.block_allocator, seq_lens=batch.seq_lens) for i in range(self.num_layers)]
+        mask = build_block_diagonal_mask(seq_lens=batch.seq_lens, kv_offsets=kv_cache_offsets, num_prefill_seqs=batch.num_prefill_seqs)
+        
+        out_logits = self.model(inputs=mx.array(batch.token_ids)[None, :], cache=cache, positions=mx.array(batch.positions), block_mask=mask)
+        
+        seq_offset = -1
+        outputs = []
+        for seq_len in batch.seq_lens:
+            seq_offset += seq_len
+            outputs += [out_logits[0, seq_offset, :]]
+            
+        return mx.stack(outputs)
