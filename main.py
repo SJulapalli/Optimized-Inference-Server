@@ -15,6 +15,7 @@ def main():
     parser.add_argument("--max-num-blocks", type=int, default=2048)
     parser.add_argument("--max-seq-len", type=int, default=8192)
     parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--prefill-chunk-size", type=int, default=512)
     args = parser.parse_args()
 
     print(f"Loading model from {args.model_path}...")
@@ -32,6 +33,7 @@ def main():
         max_num_blocks=args.max_num_blocks,
         max_seq_len=args.max_seq_len,
         block_size=args.block_size,
+        prefill_chunk_size=args.prefill_chunk_size
     )
 
     app = create_app(server_config, model_args, model, tokenizer)

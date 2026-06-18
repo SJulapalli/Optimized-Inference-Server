@@ -15,20 +15,29 @@ class Batch:
     num_prefill_seqs: int         # how many sequences at the front are prefill; the rest are decode
     kv_cache_offsets: list[int]
     
-# Positions aren't deeply managed yet, but will need to be managed once chunked inputs start being handled.
-def build_batch(schedule: SchedulerOutput):
-    sequences = schedule.prefill_sequences + schedule.decode_sequences
-    token_ids = [token for prefill_sequence in schedule.prefill_sequences for token in prefill_sequence.prompt_token_ids]
-    token_ids += [decode_sequence.get_last_token_id() for decode_sequence in schedule.decode_sequences]
+def build_batch(schedule: SchedulerOutput, prefill_chunk_size: int):
+    # v2 PREFILL path
+    seq_lens = []
+    token_ids = []
+    positions = []
+    kv_cache_offsets = []
     
-    positions = [i for sequence in schedule.prefill_sequences for i in range(sequence.num_kv_tokens)] + [sequence.num_kv_tokens - 1 for sequence in schedule.decode_sequences]
-    seq_lens = [sequence.num_prompt_tokens for sequence in schedule.prefill_sequences] + [1 for _ in schedule.decode_sequences]
-    
-    block_tables = [sequence.block_table for sequence in sequences]
+    for seq in schedule.prefill_sequences:
+        chunk_len = min(prefill_chunk_size, seq.num_prompt_tokens - seq.num_computed_tokens)
+        token_ids  += seq.prompt_token_ids[seq.num_computed_tokens : seq.num_computed_tokens + chunk_len]
+        positions  += list(range(seq.num_computed_tokens, seq.num_computed_tokens + chunk_len))
+        seq_lens.append(chunk_len)
+        kv_cache_offsets.append(seq.num_computed_tokens)   # was always 0 in v1
+
+    for seq in schedule.decode_sequences:
+        token_ids.append(seq.get_last_token_id())
+        positions.append(seq.num_kv_tokens - 1)
+        seq_lens.append(1)
+        kv_cache_offsets.append(seq.num_kv_tokens - 1)
+
+    block_tables = [sequence.block_table for sequence in schedule.prefill_sequences + schedule.decode_sequences]
     num_prefill_seqs = len(schedule.prefill_sequences)
-    
-    kv_cache_offsets = [0 if seq.status == SequenceStatus.PREFILL else seq.num_kv_tokens - 1 for seq in sequences]
-    
+        
     return Batch(token_ids=token_ids, positions=positions, block_tables=block_tables, seq_lens=seq_lens, num_prefill_seqs=num_prefill_seqs, kv_cache_offsets=kv_cache_offsets)
 
 class BatchPagedKVCache:

@@ -25,3 +25,4 @@ class ServerConfig:
     max_seq_len: int = 8192
     host: str = "0.0.0.0"
     port: int = 8000
+    prefill_chunk_size: int = 512

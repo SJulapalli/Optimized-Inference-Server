@@ -90,7 +90,7 @@ class InferenceEngine:
                     continue
 
                 sequences = schedule.prefill_sequences + schedule.decode_sequences
-                batch = build_batch(schedule)
+                batch = build_batch(schedule, self.server_config.prefill_chunk_size)
 
                 logits = self.runner.forward(batch)
                 next_tokens = sample(logits, sequences)

@@ -35,22 +35,36 @@ class Scheduler:
         
         while k < len(self.active_sequences):
             sequence = self.active_sequences[k]
-            if sequence.num_kv_tokens - len(sequence.block_table) * self.server_config.block_size >= 0:
-                try:
-                    sequence.block_table.extend(self.allocator.allocate(1))
-                except MemoryError:
-                    self.active_sequences.pop(k)
-                    sequence.status = SequenceStatus.WAITING
-                    self.allocator.free(sequence.block_table)
-                    sequence.block_table = []
-                    self.waiting_sequences.insert(0, sequence)
-                    continue
             
             if sequence.status == SequenceStatus.PREFILL:
+                chunk_len = min(self.server_config.prefill_chunk_size, sequence.num_prompt_tokens - sequence.num_computed_tokens + 1)
+                blocks_needed = ceil(ceil((sequence.num_computed_tokens + chunk_len) / self.server_config.block_size))
+                
+                if len(sequence.block_table) < blocks_needed:
+                    try:
+                        sequence.block_table.extend(self.allocator.allocate(blocks_needed - len(sequence.block_table)))
+                    except MemoryError:
+                        self.active_sequences.pop(k)
+                        sequence.status = SequenceStatus.WAITING
+                        self.allocator.free(sequence.block_table)
+                        sequence.num_computed_tokens = 0
+                        sequence.block_table = []
+                        self.waiting_sequences.insert(0, sequence)
+                        continue
                 prefill_sequences.append(sequence)
             elif sequence.status == SequenceStatus.DECODE:
+                if sequence.num_kv_tokens >= len(sequence.block_table) * self.server_config.block_size:
+                    try:
+                        sequence.block_table.extend(self.allocator.allocate(1))
+                    except MemoryError:
+                        self.active_sequences.pop(k)
+                        sequence.status = SequenceStatus.WAITING
+                        sequence.num_computed_tokens = 0
+                        self.allocator.free(sequence.block_table)
+                        sequence.block_table = []
+                        self.waiting_sequences.insert(0, sequence)
+                        continue
                 decode_sequences.append(sequence)
-                
             k += 1
 
         # Loop over waiting sequences
@@ -60,7 +74,8 @@ class Scheduler:
                 break
             
             sequence = self.waiting_sequences[i]
-            required_blocks = ceil((sequence.num_kv_tokens + 1) / self.server_config.block_size)
+            first_chunk = min(self.server_config.prefill_chunk_size, sequence.num_prompt_tokens + 1)
+            required_blocks = ceil((first_chunk) / self.server_config.block_size)
             
             # Check if sufficient KV cache blocks are available
             if self.allocator.num_free_blocks >= required_blocks:
@@ -84,12 +99,41 @@ class Scheduler:
         while i < len(self.active_sequences):
             sequence = self.active_sequences[i]
             
+            if sequence.status == SequenceStatus.PREFILL:
+                chunk_len = min(self.server_config.prefill_chunk_size,
+                                sequence.num_prompt_tokens - sequence.num_computed_tokens)
+                sequence.num_computed_tokens += chunk_len
+
+                if sequence.num_computed_tokens == sequence.num_prompt_tokens:
+                    # last chunk done — sample the first generated token and transition
+                    sequence.output_token_ids.append(next_tokens[sequence.seq_id])
+                    if (next_tokens[sequence.seq_id] == self.model_config.eos_token_id
+                            or sequence.num_kv_tokens >= self.model_config.max_seq_len
+                            or sequence.num_kv_tokens >= self.server_config.max_seq_len
+                            or sequence.num_output_tokens >= sequence.sampling_params.max_tokens):
+                        # finished on the first token
+                        self.active_sequences.pop(i)
+                        self.allocator.free(sequence.block_table)
+                        sequence.block_table = []
+                        sequence.status = SequenceStatus.FINISHED
+                        completed_sequences.append(sequence)
+                        continue
+                    sequence.status = SequenceStatus.DECODE
+                    i += 1
+                    continue
+                else:
+                    i += 1
+                    continue
+                # else: intermediate chunk, no token sampled, stay in PREFILL
+            
             # If sequence is preempted, deallocate its blocks and move it to the top of the waiting list (for fairness so the request is considered first).
+            # idt this code ever gets called
             if sequence.status == SequenceStatus.PREEMPTED:
                 self.active_sequences.pop(i)
                 sequence.status = SequenceStatus.WAITING
                 self.allocator.free(sequence.block_table)
                 sequence.block_table = []
+                sequence.num_computed_tokens = 0
                 self.waiting_sequences.insert(0, sequence)
                 continue
             
@@ -104,22 +148,6 @@ class Scheduler:
                 sequence.status = SequenceStatus.FINISHED  # Probably not needed
                 completed_sequences.append(sequence)
                 continue
-            
-            # Should no longer be necessary.
-            # Check if the sequence needs more space to continue, if it does and we can't provide it then we preempt.
-            # if sequence.num_kv_tokens - len(sequence.block_table) * self.server_config.block_size > 0:
-            #     try:
-            #         sequence.block_table.extend(self.allocator.allocate(1))
-            #     except MemoryError:
-            #         self.active_sequences.pop(i)
-            #         sequence.status = SequenceStatus.WAITING
-            #         self.allocator.free(sequence.block_table)
-            #         sequence.block_table = []
-            #         self.waiting_sequences.insert(0, sequence)
-            #         continue
-            
-            if sequence.status == SequenceStatus.PREFILL:
-                sequence.status = SequenceStatus.DECODE
             
             i += 1
         

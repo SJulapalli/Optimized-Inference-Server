@@ -1,12 +1,14 @@
 import mlx.core as mx
 from engine.sequence import SamplingParams, Sequence
+import numpy as np
 
 def _apply_repetition_penalty(logits: mx.array, token_ids: list[int], penalty: float) -> mx.array:
     if not token_ids:
         return logits
-    unique_ids = mx.array(list(set(token_ids)))
-    penalty_arr = mx.ones(logits.shape)
-    penalty_arr = penalty_arr.at[unique_ids].set(penalty)
+    unique_ids = list(set(token_ids))
+    penalty_np = np.ones(logits.shape, dtype=np.float32)
+    penalty_np[unique_ids] = penalty
+    penalty_arr = mx.array(penalty_np)
     return mx.where(logits > 0, logits / penalty_arr, logits * penalty_arr)
 
 def sample(logits_arrays: mx.array, sequences: list[Sequence]) -> dict[int, int]:

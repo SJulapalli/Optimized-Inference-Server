@@ -26,6 +26,7 @@ class Sequence:
     sampling_params: SamplingParams
 
     status: SequenceStatus = SequenceStatus.WAITING
+    num_computed_tokens: int = 0         # Only meant to be used for the prompt
 
     output_token_ids: list[int] = field(default_factory=list)  # generated tokens so far
     block_table: list[int] = field(default_factory=list)       # physical block indices, in order

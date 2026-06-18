@@ -6,7 +6,7 @@ Continuous batching inference server for Llama 3.1 on Apple Silicon (macOS). Tar
 
 ## Goals
 
-- Serve Llama 3.1 (8B target, 70B stretch) with competitive tokens/sec on M-series hardware
+- Serve Llama 3.2 (3B target, Llama 3 8B stretch) with competitive tokens/sec on M-series hardware
 - Support concurrent requests without head-of-line blocking
 - Keep KV cache memory fragmentation low via paged allocation
 - Expose an OpenAI-compatible HTTP API with streaming
