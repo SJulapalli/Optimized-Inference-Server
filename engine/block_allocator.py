@@ -1,8 +1,10 @@
 import mlx.core as mx
 from config import ModelConfig, ServerConfig
 
-def create_block_pool(model_config: ModelConfig, server_config: ServerConfig) -> mx.array:
-    return mx.zeros((server_config.max_num_blocks, model_config.num_layers, 2, model_config.num_kv_heads, server_config.block_size, model_config.head_dim), dtype=mx.float16)
+def create_block_pool(model_config, server_config):
+    N = server_config.max_num_blocks * server_config.block_size
+    return [mx.zeros((2, N, model_config.num_kv_heads, model_config.head_dim), dtype=mx.float16)
+            for _ in range(model_config.num_layers)]
 
 class BlockAllocator:
     def __init__(self, model_config: ModelConfig, server_config: ServerConfig):

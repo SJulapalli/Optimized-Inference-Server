@@ -5,3 +5,4 @@ mlx-lm>=0.13.0
 transformers>=4.36.0
 pydantic>=2.5.0
 numpy>=1.24.0
+httpx>=0.25.0

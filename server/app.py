@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse
 
 from config import ModelConfig, ServerConfig
 from engine.block_allocator import BlockAllocator
-from engine.runner import ModelRunner, build_batch
+from engine.runner import ModelRunner, build_batch, Batch
 from engine.sequence import Sequence, SamplingParams
 from model.llama import Model, ModelArgs
 from sampling.sampler import sample
@@ -26,6 +26,7 @@ from server.protocol import (
 import traceback
 from fastapi.staticfiles import StaticFiles
 import os
+import mlx.core as mx
 
 
 def _model_config_from_args(args: ModelArgs, tokenizer) -> ModelConfig:
@@ -63,10 +64,43 @@ class InferenceEngine:
         self._seq_counter = 0
         self._loop_task: asyncio.Task | None = None
 
+        # ── temporary TTFT-breakdown scaffolding (remove once diagnosed) ──
+        self._ttft_arrival: dict[int, float] = {}    # add_request time
+        self._ttft_scheduled: dict[int, float] = {}  # first time seq is in a batch
+        self._ttft_done: set[int] = set()
+
     def _next_seq_id(self) -> int:
         seq_id = self._seq_counter
         self._seq_counter += 1
         return seq_id
+
+    def warmup(self):
+        """Run a dummy prefill + decode so MLX compiles its Metal kernels at
+        startup instead of on the first real request."""
+        prompt_len = 4
+        bt = self.allocator.allocate(1)
+        try:
+            prefill = Batch(
+                token_ids=list(range(prompt_len)),
+                positions=list(range(prompt_len)),
+                block_tables=[bt],
+                seq_lens=[prompt_len],
+                num_prefill_seqs=1,
+                kv_cache_offsets=[0],
+            )
+            mx.eval(self.runner.forward(prefill))
+
+            decode = Batch(
+                token_ids=[0],
+                positions=[prompt_len],
+                block_tables=[bt],
+                seq_lens=[1],
+                num_prefill_seqs=0,
+                kv_cache_offsets=[prompt_len],
+            )
+            mx.eval(self.runner.forward(decode))
+        finally:
+            self.allocator.free(bt)
 
     async def start(self):
         self._loop_task = asyncio.create_task(self._engine_loop())
@@ -80,21 +114,82 @@ class InferenceEngine:
                 pass
 
     async def _engine_loop(self):
-        
+
         loop = asyncio.get_event_loop()
+        # ── temporary profiling scaffolding (remove once diagnosed) ──────────
+        prof = {"schedule": 0.0, "build": 0.0, "forward": 0.0,
+                "sample": 0.0, "update": 0.0, "steps": 0}
         while True:
             try:
+                t0 = time.perf_counter()
                 schedule = self.scheduler.step()
                 if not schedule.prefill_sequences and not schedule.decode_sequences:
                     await asyncio.sleep(0.001)
                     continue
+                t1 = time.perf_counter()
 
                 sequences = schedule.prefill_sequences + schedule.decode_sequences
                 batch = build_batch(schedule, self.server_config.prefill_chunk_size)
+                t2 = time.perf_counter()
 
-                logits = self.runner.forward(batch)
-                next_tokens = sample(logits, sequences)
+                # ttft: stamp the first step a sequence appears in a batch
+                for seq in sequences:
+                    if seq.seq_id not in self._ttft_scheduled:
+                        self._ttft_scheduled[seq.seq_id] = t1
+
+                def _compute(batch, sequences):
+                    logits = self.runner.forward(batch)
+                    mx.eval(logits)  # force the lazy graph so forward time isn't smeared into sample
+                    return sample(logits, sequences)
+                t3 = time.perf_counter()
+
+                next_tokens = await loop.run_in_executor(None, _compute, batch, sequences)
+                t4 = time.perf_counter()
+
                 completed = self.scheduler.update(next_tokens)
+                t5 = time.perf_counter()
+
+                prof["schedule"] += t1 - t0
+                prof["build"] += t2 - t1
+                prof["forward"] += t3 - t2
+                prof["sample"] += t4 - t3
+                prof["update"] += t5 - t4
+                prof["steps"] += 1
+                if prof["steps"] % 25 == 0:
+                    n = prof["steps"]
+                    tot = sum(prof[k] for k in ("schedule", "build", "forward", "sample", "update"))
+                    print(
+                        f"[prof] step={n} avg_step={tot / n * 1000:6.1f}ms | "
+                        f"sched={prof['schedule'] / n * 1000:5.1f} "
+                        f"build={prof['build'] / n * 1000:5.1f} "
+                        f"fwd={prof['forward'] / n * 1000:6.1f} "
+                        f"samp={prof['sample'] / n * 1000:5.1f} "
+                        f"upd={prof['update'] / n * 1000:5.1f} || "
+                        f"this_step={(t5 - t0) * 1000:6.1f}ms "
+                        f"toks={len(batch.token_ids)} "
+                        f"nprefill={batch.num_prefill_seqs} "
+                        f"ndecode={len(schedule.decode_sequences)} "
+                        f"preempt={self.scheduler.num_preemptions} "
+                        f"free_blocks={self.allocator.num_free_blocks}",
+                        flush=True,
+                    )
+                # ttft: first token produced for a sequence (prefill complete)
+                for seq in sequences:
+                    sid = seq.seq_id
+                    if sid not in self._ttft_done and len(seq.output_token_ids) >= 1:
+                        self._ttft_done.add(sid)
+                        arr = self._ttft_arrival.get(sid)
+                        sch = self._ttft_scheduled.get(sid, t5)
+                        if arr is not None:
+                            print(
+                                f"[ttft] seq={sid:<3} queue={(sch - arr) * 1000:7.1f}ms "
+                                f"prefill={(t5 - sch) * 1000:7.1f}ms "
+                                f"server_total={(t5 - arr) * 1000:8.1f}ms || "
+                                f"step nprefill={batch.num_prefill_seqs} "
+                                f"ndecode={len(schedule.decode_sequences)}",
+                                flush=True,
+                            )
+                # ────────────────────────────────────────────────────────────
 
                 for seq in sequences:
                     q = self.output_queues.get(seq.seq_id)
@@ -122,6 +217,7 @@ class InferenceEngine:
             prompt_token_ids=prompt_token_ids,
             sampling_params=sampling_params,
         )
+        self._ttft_arrival[seq_id] = time.perf_counter()  # ttft scaffolding
         self.scheduler.add_sequence(seq)
         return seq_id
 
@@ -144,6 +240,11 @@ def create_app(
 ) -> FastAPI:
     model_config = _model_config_from_args(model_args, tokenizer)
     engine = InferenceEngine(server_config, model_config, model, tokenizer)
+
+    print("Warming up (compiling kernels)...", flush=True)
+    _t = time.time()
+    engine.warmup()
+    print(f"Warmup complete in {time.time() - _t:.1f}s.", flush=True)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

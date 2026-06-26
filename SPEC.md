@@ -20,7 +20,7 @@ Continuous batching inference server for Llama 3.1 on Apple Silicon (macOS). Tar
 - Training or fine-tuning
 
 ---
-
+2
 ## Architecture Overview
 
 ```

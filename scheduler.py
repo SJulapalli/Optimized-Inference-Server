@@ -18,6 +18,7 @@ class Scheduler:
         self.model_config = model_config
         self.server_config = server_config
         self.allocator = block_allocator if block_allocator is not None else BlockAllocator(model_config, server_config)
+        self.num_preemptions = 0  # temporary instrumentation (remove once diagnosed)
 
         
     def add_sequence(self, sequence: Sequence):
@@ -44,6 +45,7 @@ class Scheduler:
                     try:
                         sequence.block_table.extend(self.allocator.allocate(blocks_needed - len(sequence.block_table)))
                     except MemoryError:
+                        self.num_preemptions += 1
                         self.active_sequences.pop(k)
                         sequence.status = SequenceStatus.WAITING
                         self.allocator.free(sequence.block_table)
@@ -57,6 +59,7 @@ class Scheduler:
                     try:
                         sequence.block_table.extend(self.allocator.allocate(1))
                     except MemoryError:
+                        self.num_preemptions += 1
                         self.active_sequences.pop(k)
                         sequence.status = SequenceStatus.WAITING
                         sequence.num_computed_tokens = 0
